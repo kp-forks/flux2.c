@@ -23,6 +23,9 @@ typedef struct flux_vae flux_vae_t;
 typedef struct flux_transformer flux_transformer_t;
 typedef struct flux_text_encoder flux_text_encoder_t;
 
+/* Global verbose flag (defined in flux_sample.c, set by flux_set_verbose) */
+extern int g_verbose;
+
 /* Internal function declarations */
 extern flux_tokenizer *flux_tokenizer_load(const char *path);
 extern void flux_tokenizer_free(flux_tokenizer *tok);
@@ -478,19 +481,9 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
  * Image Generation
  * ======================================================================== */
 
-static struct timespec g_start_time;
-
-static void default_progress(int step, int total) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double elapsed = (now.tv_sec - g_start_time.tv_sec) +
-                     (now.tv_nsec - g_start_time.tv_nsec) / 1e9;
-    double per_step = (step > 0) ? elapsed / step : 0;
-    double remaining = per_step * (total - step);
-
-    fprintf(stderr, "\rStep %d/%d (%.1fs elapsed, ~%.1fs remaining)    ",
-            step, total, elapsed, remaining);
-    if (step == total) fprintf(stderr, "\n");
+/* Substep progress callback - prints single character inline */
+static void default_substep_callback(char c) {
+    fputc(c, stderr);
     fflush(stderr);
 }
 
@@ -546,9 +539,8 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     /* Get schedule */
     float *schedule = flux_linear_schedule(p.num_steps);
 
-    /* Sample */
-    void (*progress)(int, int) = ctx->verbose ? default_progress : NULL;
-    if (progress) clock_gettime(CLOCK_MONOTONIC, &g_start_time);
+    /* Sample with progress display */
+    if (g_verbose) flux_substep_callback = default_substep_callback;
 
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->text_encoder,
@@ -557,8 +549,10 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
         NULL,  /* No null embedding for klein */
         schedule, p.num_steps,
         p.guidance_scale,
-        progress
+        NULL
     );
+
+    flux_substep_callback = NULL;
 
     free(z);
     free(schedule);
@@ -660,9 +654,8 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
         fprintf(stderr, "]\n");
     }
 
-    /* Sample */
-    void (*progress)(int, int) = ctx->verbose ? default_progress : NULL;
-    if (progress) clock_gettime(CLOCK_MONOTONIC, &g_start_time);
+    /* Sample with progress display */
+    if (g_verbose) flux_substep_callback = default_substep_callback;
 
     struct timespec t_sample_start, t_sample_end, t_vae_start, t_vae_end;
     clock_gettime(CLOCK_MONOTONIC, &t_sample_start);
@@ -674,9 +667,10 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
         NULL,
         schedule, p.num_steps,
         p.guidance_scale,
-        progress
+        NULL
     );
 
+    flux_substep_callback = NULL;
     clock_gettime(CLOCK_MONOTONIC, &t_sample_end);
 
     free(z);
@@ -770,9 +764,8 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
         fprintf(stderr, "]\n");
     }
 
-    /* Sample */
-    void (*progress)(int, int) = ctx->verbose ? default_progress : NULL;
-    if (progress) clock_gettime(CLOCK_MONOTONIC, &g_start_time);
+    /* Sample with progress display */
+    if (g_verbose) flux_substep_callback = default_substep_callback;
 
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->text_encoder,
@@ -781,8 +774,10 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
         NULL,
         schedule, p.num_steps,
         p.guidance_scale,
-        progress
+        NULL
     );
+
+    flux_substep_callback = NULL;
 
     free(z);
     free(schedule);
@@ -902,17 +897,18 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         schedule[i] = strength * (1.0f - (float)i / num_steps);
     }
 
-    /* Sample */
-    void (*progress)(int, int) = ctx->verbose ? default_progress : NULL;
-    if (progress) clock_gettime(CLOCK_MONOTONIC, &g_start_time);
+    /* Sample with progress display */
+    if (g_verbose) flux_substep_callback = default_substep_callback;
 
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->text_encoder,
         img_latent, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
         text_emb, text_seq, NULL,
         schedule, num_steps,
-        p.guidance_scale, progress
+        p.guidance_scale, NULL
     );
+
+    flux_substep_callback = NULL;
 
     free(img_latent);
     free(schedule);

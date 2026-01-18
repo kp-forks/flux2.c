@@ -211,6 +211,22 @@ After conv BLAS:      ~24s total (Transformer=22s, VAE=0.1s)
   - Batched GEMM for attention heads
   - Memory layout optimization for cache efficiency
 
+## Progress Display
+
+When running with `-v` (verbose mode), the inference shows fine-grained progress:
+```
+Step 1... dddddssssF
+Step 2... dddddssssF
+```
+
+Progress characters:
+- `d` = Double-stream block completed (5 total per step)
+- `s` = 5 single-stream blocks completed (4 groups of 5 = 20 total)
+- `F` = Final layer completed
+
+The progress callback is set via `flux_set_verbose(1)` and uses the global
+`flux_substep_callback` which is called from `flux_transformer_forward`.
+
 ## Test Verification
 Reference image: test_vectors/reference_1step_64x64_seed42.png
 After any optimization, verify with:

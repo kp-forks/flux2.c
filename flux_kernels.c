@@ -18,6 +18,9 @@
 #include <cblas.h>
 #endif
 
+/* Progress callback - called during transformer forward for fine-grained progress */
+flux_substep_callback_t flux_substep_callback = NULL;
+
 /* ========================================================================
  * Random Number Generator (xoshiro256**)
  * ======================================================================== */

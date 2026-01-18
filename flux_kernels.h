@@ -278,4 +278,15 @@ void flux_transpose(float *out, const float *in, int M, int N);
 /* Reshape (just changes interpretation, no data movement) */
 /* ... handled at higher level ... */
 
+/* ========================================================================
+ * Progress Callback
+ * ======================================================================== */
+
+/* Substep progress callback - called during transformer forward pass
+ * to report fine-grained progress within a sampling step.
+ * The callback receives a single character to print (e.g., '.' or 'd').
+ */
+typedef void (*flux_substep_callback_t)(char c);
+extern flux_substep_callback_t flux_substep_callback;
+
 #endif /* FLUX_KERNELS_H */

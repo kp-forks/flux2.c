@@ -247,6 +247,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Set verbose mode on context */
+    flux_set_verbose(verbose);
+
     if (verbose) {
         double load_time = (double)(clock() - start) / CLOCKS_PER_SEC;
         fprintf(stderr, "Model loaded in %.2f seconds\n", load_time);

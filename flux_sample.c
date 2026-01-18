@@ -169,6 +169,12 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;  /* Negative for denoising */
 
+        /* Print step progress header */
+        if (flux_substep_callback) {
+            fprintf(stderr, "Step %d... ", step + 1);
+            fflush(stderr);
+        }
+
         /* Predict velocity with conditioning */
         v_cond = flux_transformer_forward(tf, z_curr, h, w,
                                           text_emb, text_seq, t_curr);
@@ -190,6 +196,11 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
         flux_axpy(z_curr, dt, v_cond, latent_size);
 
         free(v_cond);
+
+        /* End of step - print newline if showing substep progress */
+        if (flux_substep_callback) {
+            fprintf(stderr, "\n");
+        }
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
@@ -406,7 +417,7 @@ float *flux_generate_latent(void *ctx_ptr,
  * Progress and Logging
  * ======================================================================== */
 
-static int g_verbose = 0;
+int g_verbose = 0;
 
 void flux_set_verbose(int verbose) {
     g_verbose = verbose;
