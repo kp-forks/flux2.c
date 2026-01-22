@@ -2422,11 +2422,9 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         }
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
-#ifdef USE_METAL
-            flux_metal_clear_weight_cache_only();
-            flux_metal_clear_bf16_cache_only();
-            flux_metal_clear_f16_cache_only();
-#endif
+            /* With direct mmap pointers for bf16, no need to clear caches.
+             * Each block has stable unique addresses in the mmap region.
+             * Cache entries persist and get reused on subsequent steps. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
@@ -2495,11 +2493,7 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
 
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
-#ifdef USE_METAL
-            flux_metal_clear_weight_cache_only();
-            flux_metal_clear_bf16_cache_only();
-            flux_metal_clear_f16_cache_only();
-#endif
+            /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
@@ -2901,11 +2895,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         /* In mmap mode, free block weights after use */
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
-#ifdef USE_METAL
-            flux_metal_clear_weight_cache_only();
-            flux_metal_clear_bf16_cache_only();
-            flux_metal_clear_f16_cache_only();
-#endif
+            /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
@@ -3131,11 +3121,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             /* In mmap mode, free block weights after use */
             if (tf->use_mmap) {
                 free_single_block_weights(&tf->single_blocks[i]);
-#ifdef USE_METAL
-                flux_metal_clear_weight_cache_only();
-                flux_metal_clear_bf16_cache_only();
-                flux_metal_clear_f16_cache_only();
-#endif
+                /* With direct mmap pointers for bf16, no need to clear caches. */
             }
             if (flux_substep_callback)
                 flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
@@ -3376,11 +3362,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              combined_img_seq, txt_seq, tf);
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
-#ifdef USE_METAL
-            flux_metal_clear_weight_cache_only();
-            flux_metal_clear_bf16_cache_only();
-            flux_metal_clear_f16_cache_only();
-#endif
+            /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
@@ -3405,11 +3387,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              total_seq, txt_seq, tf);
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
-#ifdef USE_METAL
-            flux_metal_clear_weight_cache_only();
-            flux_metal_clear_bf16_cache_only();
-            flux_metal_clear_f16_cache_only();
-#endif
+            /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
