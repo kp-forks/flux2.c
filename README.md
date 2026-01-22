@@ -32,6 +32,22 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 
 *Generated with: `./flux -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-model`*
 
+### Terminal Image Display
+
+![Kitty protocol example](images/kitty-example.png)
+
+Display generated images directly in your terminal with `--show`, or watch the denoising process step-by-step with `--show-steps`:
+
+```bash
+# Display final image in terminal
+./flux -d flux-klein-model -p "a cute robot" -o robot.png --show
+
+# Display each denoising step (slower, but interesting to watch)
+./flux -d flux-klein-model -p "a cute robot" -o robot.png --show-steps
+```
+
+Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/), such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/).
+
 ## Features
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
@@ -97,6 +113,8 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 ```
 -q, --quiet           Silent mode, no output
 -v, --verbose         Show detailed config and timing info
+    --show            Display image in terminal (Kitty protocol)
+    --show-steps      Display each denoising step (slow)
 ```
 
 **Other options:**
