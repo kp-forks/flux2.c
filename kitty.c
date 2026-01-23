@@ -1,10 +1,13 @@
 /*
- * kitty.c - Kitty terminal graphics protocol support
+ * kitty.c - Terminal graphics protocol support (Kitty and iTerm2)
  *
- * The Kitty graphics protocol allows displaying images directly in the terminal.
- * Format: \033_G<control>;<base64-payload>\033\\
+ * Kitty graphics protocol:
+ *   Format: \033_G<control>;<base64-payload>\033\\
+ *   For large images, data is sent in chunks with m=1 (more) or m=0 (last).
  *
- * For large images, data is sent in chunks with m=1 (more coming) or m=0 (last).
+ * iTerm2 inline image protocol:
+ *   Format: \033]1337;File=inline=1:<base64-payload>\a
+ *   See: https://iterm2.com/documentation-images.html
  */
 
 #include "kitty.h"
@@ -170,4 +173,69 @@ int kitty_display_image(const flux_image *img) {
     free(b64_data);
     printf("\n");
     return 0;
+}
+
+/*
+ * Send PNG data using iTerm2 inline image protocol.
+ * Format: \033]1337;File=inline=1:<base64>\a
+ */
+static int iterm2_send_png(const unsigned char *png_data, size_t png_size) {
+    size_t b64_len;
+    char *b64_data = base64_encode(png_data, png_size, &b64_len);
+    if (!b64_data) return -1;
+
+    /* iTerm2 protocol: OSC 1337 ; File=inline=1 : <base64> BEL */
+    printf("\033]1337;File=inline=1:");
+    fwrite(b64_data, 1, b64_len, stdout);
+    printf("\a\n");
+    fflush(stdout);
+
+    free(b64_data);
+    return 0;
+}
+
+int iterm2_display_png(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "iterm2: cannot open %s\n", path);
+        return -1;
+    }
+
+    /* Get file size */
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fclose(f);
+        return -1;
+    }
+
+    /* Read PNG data */
+    unsigned char *png_data = malloc(size);
+    if (!png_data) {
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(png_data, 1, size, f) != (size_t)size) {
+        free(png_data);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    int result = iterm2_send_png(png_data, size);
+    free(png_data);
+    return result;
+}
+
+int terminal_display_png(const char *path, term_graphics_proto proto) {
+    switch (proto) {
+        case TERM_PROTO_ITERM2:
+            return iterm2_display_png(path);
+        case TERM_PROTO_KITTY:
+        default:
+            return kitty_display_png(path);
+    }
 }

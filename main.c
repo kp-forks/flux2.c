@@ -219,7 +219,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
     fprintf(stderr, "      --show            Display image in terminal (Kitty protocol)\n");
-    fprintf(stderr, "      --show-steps      Display each denoising step (slow)\n\n");
+    fprintf(stderr, "      --show-steps      Display each denoising step (slow)\n");
+    fprintf(stderr, "      --iterm2          Use iTerm2 protocol instead of Kitty\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -264,6 +265,7 @@ int main(int argc, char *argv[]) {
         {"no-mmap",    no_argument,       0, 'M'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
+        {"iterm2",     no_argument,       0, 'I'},
         {"debug-py",   no_argument,       0, 'D'},
         {0, 0, 0, 0}
     };
@@ -289,6 +291,7 @@ int main(int argc, char *argv[]) {
     int show_image = 0;
     int show_steps = 0;
     int debug_py = 0;
+    term_graphics_proto graphics_proto = TERM_PROTO_KITTY;
 
     int opt;
     while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
@@ -315,6 +318,7 @@ int main(int argc, char *argv[]) {
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
+            case 'I': graphics_proto = TERM_PROTO_ITERM2; break;
             case 'D': debug_py = 1; break;
             default:
                 print_usage(argv[0]);
@@ -409,6 +413,9 @@ int main(int argc, char *argv[]) {
 
     /* Set up step image callback if requested */
     if (show_steps) {
+        if (graphics_proto == TERM_PROTO_ITERM2) {
+            fprintf(stderr, "Warning: --show-steps requires Kitty protocol, ignoring --iterm2 for step display\n");
+        }
         flux_set_step_image_callback(ctx, cli_step_image_callback);
     }
 
@@ -568,7 +575,7 @@ int main(int argc, char *argv[]) {
 
     /* Display image in terminal if requested */
     if (show_image) {
-        kitty_display_image(output);
+        terminal_display_png(output_path, graphics_proto);
     }
 
     /* Print total time (always, unless quiet) */
