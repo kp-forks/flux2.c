@@ -2952,11 +2952,16 @@ int flux_metal_init_shaders(void) {
 
         /* Try to find the shader file in various locations */
         NSString *shaderPath = nil;
-        NSArray *searchPaths = @[
+        NSMutableArray *searchPaths = [NSMutableArray arrayWithObjects:
             @"flux_shaders.metal",
             @"./flux_shaders.metal",
-            [[NSBundle mainBundle] pathForResource:@"flux_shaders" ofType:@"metal"],
-        ];
+            @"flux2.c/flux_shaders.metal",
+            @"./flux2.c/flux_shaders.metal",
+            nil];
+        NSString *bundlePath = [[NSBundle mainBundle] pathForResource:@"flux_shaders" ofType:@"metal"];
+        if (bundlePath) {
+            [searchPaths addObject:bundlePath];
+        }
 
         for (NSString *path in searchPaths) {
             if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
