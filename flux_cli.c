@@ -747,7 +747,9 @@ static void print_banner(void) {
     printf("Model: %s\n", state.model_dir);
 
     if (state.show_enabled) {
-        printf("Display: Kitty graphics enabled\n");
+        const char *proto_name = (cli_term_proto == TERM_PROTO_KITTY) ? "Kitty" :
+                                 (cli_term_proto == TERM_PROTO_ITERM2) ? "iTerm2" : "unknown";
+        printf("Display: %s graphics enabled\n", proto_name);
     } else {
         printf("Display: Images saved to %s/\n", state.tmpdir);
     }
