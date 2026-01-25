@@ -301,13 +301,13 @@ Both download the same files to `./flux-klein-model`:
 
 Benchmarks on **Apple M3 Max** (128GB RAM), generating a 4-step image.
 
-The MPS implementation matches the PyTorch optimized pipeline performance.
+The MPS implementation matches the PyTorch optimized pipeline performance, providing better speed for small image sizes.
 
 | Size | C (MPS) | PyTorch (MPS) |
 |------|---------|---------------|
-| 256x256 | 8.4s | 11s |
-| 512x512 | 11.7s | 13s |
-| 1024x1024 | 27.9s | 25s |
+| 256x256 | 5.6s | 11s |
+| 512x512 | 9.1s | 13s |
+| 1024x1024 | 26s | 25s |
 
 **Notes:**
 - All times measured as wall clock, including model loading, no warmup. PyTorch times exclude library import overhead (~5-10s) to be fair.
