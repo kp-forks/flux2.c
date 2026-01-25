@@ -254,6 +254,10 @@ static int generate_image(const char *prompt, const char *ref_image,
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
 
+    /* Start timing */
+    struct timespec start_time, end_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+
     /* Generate */
     flux_image *img;
     if (ref_image) {
@@ -286,6 +290,11 @@ static int generate_image(const char *prompt, const char *ref_image,
         img = flux_generate(state.ctx, prompt, &params);
     }
 
+    /* End timing */
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    double elapsed = (end_time.tv_sec - start_time.tv_sec) +
+                     (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+
     if (!img) {
         fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
         return -1;
@@ -301,7 +310,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     strncpy(state.last_image, path, sizeof(state.last_image) - 1);
     int ref_id = ref_add(path);
 
-    printf("Done -> %s (ref $%d)\n", path, ref_id);
+    printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
     display_image(path);
 
     return 0;
@@ -321,6 +330,10 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     }
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
+
+    /* Start timing */
+    struct timespec start_time, end_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
 
     /* Load reference images */
     flux_image **refs = (flux_image **)malloc(num_refs * sizeof(flux_image *));
@@ -355,6 +368,11 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     }
     free(refs);
 
+    /* End timing */
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    double elapsed = (end_time.tv_sec - start_time.tv_sec) +
+                     (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+
     if (!img) {
         fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
         return -1;
@@ -370,7 +388,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     strncpy(state.last_image, path, sizeof(state.last_image) - 1);
     int ref_id = ref_add(path);
 
-    printf("Done -> %s (ref $%d)\n", path, ref_id);
+    printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
     display_image(path);
 
     return 0;
