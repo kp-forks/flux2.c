@@ -2302,8 +2302,24 @@ cleanup:
     return 0;
 }
 
+/* BF16 GPU-accelerated transformer forward pass.
+ *
+ * Parameters:
+ *   img_transposed - Image tokens in NLC format (may include reference tokens for img2img)
+ *   img_seq        - Total image sequence length (target + reference for img2img)
+ *   extract_seq    - Number of tokens to extract for output (target only for img2img)
+ *   txt_emb        - Text embeddings
+ *   txt_seq        - Text sequence length
+ *   t_emb          - Timestep embedding
+ *   img_rope_*     - RoPE embeddings for image (includes reference RoPE for img2img)
+ *   txt_rope_*     - RoPE embeddings for text
+ *
+ * For text-to-image: img_seq == extract_seq (all image tokens are output)
+ * For img2img: img_seq > extract_seq (only target tokens are output)
+ */
 static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                             const float *img_transposed, int img_seq,
+                                            int extract_seq,
                                             const float *txt_emb, int txt_seq,
                                             const float *t_emb,
                                             const float *img_rope_cos, const float *img_rope_sin,
@@ -2519,14 +2535,16 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     single_block_bf16_scratch_free(&single_scratch);
     single_time = tf_get_time_ms() - single_start;
 
-    /* Slice image portion for final layer */
-    img_hidden_final = flux_gpu_tensor_alloc_f16((size_t)img_seq * hidden);
+    /* Slice image portion for final layer.
+     * For text2img: extract_seq == img_seq (extract all image tokens)
+     * For img2img: extract_seq < img_seq (extract only target tokens, skip reference) */
+    img_hidden_final = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
     if (!img_hidden_final) {
         BF16_DEBUG("[BF16] failed to slice image hidden\n");
         goto cleanup;
     }
     flux_gpu_batch_begin();
-    flux_gpu_slice_seq_bf16(img_hidden_final, concat_hidden, img_seq, hidden, txt_seq);
+    flux_gpu_slice_seq_bf16(img_hidden_final, concat_hidden, extract_seq, hidden, txt_seq);
     flux_gpu_batch_end();
 
     /* Final layer (bf16) */
@@ -2540,17 +2558,17 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         goto cleanup;
     }
 
-    final_norm = flux_gpu_tensor_alloc_f16((size_t)img_seq * hidden);
+    final_norm = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
     if (!final_norm) {
         BF16_DEBUG("[BF16] failed to allocate final_norm\n");
         goto cleanup;
     }
     flux_gpu_batch_begin();
     flux_gpu_adaln_norm_bf16(final_norm, img_hidden_final, final_shift, final_scale,
-                             img_seq, hidden, 1e-6f);
+                             extract_seq, hidden, 1e-6f);
 
     output_bf16 = flux_gpu_linear_bf16_native(final_norm, tf->final_proj_weight_bf16,
-                                              img_seq, hidden, channels);
+                                              extract_seq, hidden, channels);
     if (!output_bf16) {
         BF16_DEBUG("[BF16] final projection failed\n");
         goto cleanup;
@@ -2566,21 +2584,21 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     /* Ensure any queued GPU work is complete before reading back. */
     flux_gpu_sync();
 
-    output_nlc = (float *)malloc((size_t)img_seq * channels * sizeof(float));
+    output_nlc = (float *)malloc((size_t)extract_seq * channels * sizeof(float));
     if (!output_nlc) {
         BF16_DEBUG("[BF16] failed to allocate output_nlc\n");
         goto cleanup;
     }
     flux_gpu_tensor_read(output_f32, output_nlc);
 
-    output = (float *)malloc((size_t)img_seq * channels * sizeof(float));
+    output = (float *)malloc((size_t)extract_seq * channels * sizeof(float));
     if (!output) {
         BF16_DEBUG("[BF16] failed to allocate output\n");
         goto cleanup;
     }
-    for (int pos = 0; pos < img_seq; pos++) {
+    for (int pos = 0; pos < extract_seq; pos++) {
         for (int c = 0; c < channels; c++) {
-            output[c * img_seq + pos] = output_nlc[pos * channels + c];
+            output[c * extract_seq + pos] = output_nlc[pos * channels + c];
         }
     }
     final_time = tf_get_time_ms() - final_start;
@@ -2820,6 +2838,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             fprintf(stderr, "[BF16] Using fused bf16 pipeline for transformer\n");
         }
         float *bf16_output = flux_transformer_forward_bf16(tf, img_transposed, img_seq,
+                                                           img_seq, /* extract_seq = img_seq for txt2img */
                                                            txt_emb, txt_seq, t_emb,
                                                            img_rope_cos, img_rope_sin,
                                                            txt_rope_cos, txt_rope_sin);
@@ -3336,6 +3355,35 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
         }
     }
 
+#ifdef USE_METAL
+    /* Try BF16 GPU-accelerated path for img2img.
+     * Pass combined_img_seq as img_seq (full sequence including reference),
+     * but only extract img_seq (target) tokens at the end. */
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+        static int bf16_refs_logged = 0;
+        if (!bf16_refs_logged) {
+            bf16_refs_logged = 1;
+            fprintf(stderr, "[BF16] Using fused bf16 pipeline for img2img with refs\n");
+        }
+        float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
+                                                           img_seq, /* extract_seq = target only */
+                                                           txt_emb, txt_seq, t_emb,
+                                                           combined_rope_cos, combined_rope_sin,
+                                                           txt_rope_cos, txt_rope_sin);
+        if (bf16_output) {
+            free(combined_transposed);
+            free(t_emb);
+            free(combined_rope_cos);
+            free(combined_rope_sin);
+            free(txt_rope_cos);
+            free(txt_rope_sin);
+            return bf16_output;
+        } else {
+            BF16_DEBUG("[BF16] bf16 pipeline failed for refs, falling back\n");
+        }
+    }
+#endif
+
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
@@ -3563,6 +3611,33 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
         }
         trans_offset += ref_seq;
     }
+
+#ifdef USE_METAL
+    /* Try BF16 GPU-accelerated path for multi-ref img2img. */
+    if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+        static int bf16_multiref_logged = 0;
+        if (!bf16_multiref_logged) {
+            bf16_multiref_logged = 1;
+            fprintf(stderr, "[BF16] Using fused bf16 pipeline for multi-ref img2img\n");
+        }
+        float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
+                                                           img_seq, /* extract_seq = target only */
+                                                           txt_emb, txt_seq, t_emb,
+                                                           combined_rope_cos, combined_rope_sin,
+                                                           txt_rope_cos, txt_rope_sin);
+        if (bf16_output) {
+            free(combined_transposed);
+            free(t_emb);
+            free(combined_rope_cos);
+            free(combined_rope_sin);
+            free(txt_rope_cos);
+            free(txt_rope_sin);
+            return bf16_output;
+        } else {
+            BF16_DEBUG("[BF16] bf16 pipeline failed for multi-refs, falling back\n");
+        }
+    }
+#endif
 
     /* Project combined image latent to hidden */
     float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
