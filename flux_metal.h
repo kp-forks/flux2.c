@@ -401,6 +401,9 @@ void flux_gpu_rms_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
 /* BF16 element-wise add: out = a + b */
 void flux_gpu_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tensor_t b, int n);
 
+/* BF16 buffer copy (GPU blit): dst = src */
+void flux_gpu_copy_bf16(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n);
+
 /* BF16 SiLU multiply: gate = silu(gate) * up */
 void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
 

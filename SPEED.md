@@ -28,19 +28,19 @@
 ## Current Baseline (2026-02-06 / MacBook Pro M3 Max 40-core GPU, 128 GB, 400 GB/s)
 
 ### 256x256 (seq=256+512=768 tokens)
-- Text encoding: 1.9s (Qwen3, cached on 2nd run) — 11.8s cold start
+- Text encoding: 1.0s (Qwen3, GPU-resident forward, was 1.9s)
 - Denoising total: 2073 ms (4 steps)
   - Step 1: ~570 ms, Steps 2-4: ~500 ms each
 - VAE decode: 0.4s
 - Transformer loading: 1.3s (includes bf16 weight cache warmup)
-- **Total: ~5.9s (cold text encoder), ~4.3s (warm)**
+- **Total: ~5.4s**
 
 ### 512x512 (seq=1024+512=1536 tokens)
-- Text encoding: 1.9s
+- Text encoding: 1.0s
 - Denoising total: 4004 ms (4 steps)
   - Step 1: ~1058 ms, Steps 2-4: ~980 ms each
 - VAE decode: 1.6s
-- **Total: ~9.1s**
+- **Total: ~8.6s**
 
 ### Key observations
 - Monolithic GPU batch: 1 command buffer per step (all 25 blocks + concat + slice + final)
@@ -91,10 +91,56 @@
 - **Result: 256x256 denoising 2172 → 2073ms (4.6% faster), 512x512 4146 → 4004ms (3.4% faster)**
 - **Cumulative: 256x256 2822 → 2073ms (27% faster), 512x512 4420 → 4004ms (9% faster)**
 
-### Next targets
-- 256x256: ~2073ms denoising — steady-state steps ~500ms, step 1 ~570ms
-- 512x512: ~4004ms denoising — steady-state steps ~980ms, step 1 ~1058ms
-- Remaining overhead: matmul compute dominates. MPS matmul at ~4.5 TFLOPS for these dimensions.
+### Attempt 3: Double block scratch pool (FAILED)
+- Pre-allocated 20 GPU tensors per double block (norm, QKV, proj, FFN) as persistent scratch
+- Reused across 5 double block iterations, avoiding alloc/free per block
+- Added `flux_gpu_linear_bf16_native_into()` to write into pre-allocated buffers
+- **Result: 2046-2069ms vs 2073ms baseline — within noise. Reverted.**
+- Metal buffer pool already makes alloc/free fast; within monolithic batch, no overhead.
+
+### Attempt 4: Merged QKV + gate/up weight matrices (FAILED)
+- Merged Q+K+V into single [3*hidden, hidden] matmul, split with `split_3_bf16` shader
+- Merged gate+up into single [2*mlp_hidden, hidden] matmul, fused `silu_mul_merged_bf16` shader
+- Merged weights created at warmup time, stored persistently in `double_block_t`
+- Reduces 103 → 73 MPS matmul encodes per step (30 fewer, 29% reduction)
+- Tests pass (3/3), correct output
+- **Result: 256x256 2064-2092ms (no improvement), 512x512 4042-4072ms (no improvement). Reverted.**
+- Root cause: with monolithic GPU batch, GPU compute dominates (~500ms/step).
+  CPU encoding of all 103 matmuls completes in ~30ms while GPU executes ~500ms.
+  Reducing CPU encoding from 30ms to 22ms has zero observable effect.
+- **Key insight**: Once a monolithic command buffer is in place, reducing the NUMBER
+  of GPU operations doesn't help. Only reducing total GPU COMPUTE TIME matters.
+
+### Analysis: Transformer at GPU compute limit
+- 103 MPS matmul encodes per step, all in 1 command buffer
+- CPU encoding time (~30ms) << GPU execution time (~500ms at 256x256)
+- MPS matmul achieves ~4.5 TFLOPS (32% of peak f32)
+- Scratch pool, merged weights, and encode reduction have no effect
+- Further denoising optimization requires reducing FLOP count or increasing GPU utilization
+
+### Attempt 5: Monolithic GPU Qwen3 text encoder (SUCCESS)
+- Previous: each of 36 layers did CPU RMSnorm + GPU matmul + download to CPU = 72 GPU syncs
+- New: keep hidden state on GPU (bf16) across all layers, 1 sync at the end
+- Also skip layers 27-35 (only layers 0-26 needed for output extraction at 8, 17, 26)
+- GPU blit copy saves hidden state at extraction layers within the command buffer
+- bf16→f32 conversion enqueued before batch_end(), read after sync
+- All existing GPU primitives reused (rms_norm_bf16, add_bf16, causal_attention_bf16, etc.)
+- No new shaders needed — just rewired the data flow
+- Syncs: 72 → 1, layers computed: 36 → 27 (25% compute reduction)
+- **Result: text encoding 1.9s → 1.0s (47% faster)**
+- End-to-end: 256x256 5.9s → 5.4s, 512x512 9.1s → 8.6s
+
+### Next targets — beyond transformer denoising
+- **Text encoder (Qwen3)**: now 1.0s (was 1.9s) — 1.0s remaining is mostly GPU compute
+  - Theoretical minimum ~430ms (1.94 TFLOPS, assuming 4.5 TFLOPS achieved throughput)
+  - Look at `./mlx/mlx/backend/metal/` for Apple Metal kernel insights (JITs, tiling strategies)
+- **VAE decoder**: 0.4s (256x256), 1.6s (512x512) — scales with resolution
+- **1024x1024 generation**: different dynamics — img_seq = 4096 tokens, attention-heavy
+  - Attention becomes larger fraction of compute (O(n^2) scaling)
+  - Custom fused attention kernel may help at larger seq lengths
+- **img2img with `-i`**: adds reference image tokens, further increases sequence length
+- **Step 1 warmup**: ~15% slower than subsequent steps (residual MPS JIT)
+  - Already tried JIT pre-warming (Attempt 1b), didn't help
 
 ## Credits attribution rules
 - Ideas / kernels / approaches should be only taken from BSD / MIT licensed code.

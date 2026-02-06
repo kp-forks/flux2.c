@@ -4852,6 +4852,31 @@ void flux_gpu_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t a, flux_gpu_tens
     }
 }
 
+/* BF16 buffer copy using blit encoder (efficient GPU-side memcpy) */
+void flux_gpu_copy_bf16(flux_gpu_tensor_t dst, flux_gpu_tensor_t src, size_t n) {
+    if (!g_initialized || !dst || !src || n == 0) return;
+    if (!dst->is_f16 || !src->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+        size_t bytes = n * sizeof(uint16_t);
+        [blit copyFromBuffer:src->buffer sourceOffset:0
+                    toBuffer:dst->buffer destinationOffset:0
+                        size:bytes];
+        [blit endEncoding];
+
+        dst->has_pending_work = 1;
+        src->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            dst->has_pending_work = 0;
+            src->has_pending_work = 0;
+        }
+    }
+}
+
 /* BF16 SiLU multiply: gate = silu(gate) * up */
 void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n) {
     if (!g_shaders_initialized || !g_silu_mul_bf16_pipeline) return;

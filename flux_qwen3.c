@@ -789,6 +789,249 @@ static void qwen3_layer_forward_bf16(qwen3_model_t *model, qwen3_layer_t *layer,
         model->hidden_state[i] = model->residual[i] + model->mlp_out[i];
     }
 }
+
+/* ========================================================================
+ * Fully GPU-Resident Forward Pass
+ *
+ * Keeps hidden state on GPU (bf16) across all layers, eliminating the
+ * 72 CPU-GPU syncs (2 per layer × 36 layers) of the mixed path above.
+ * Only one GPU sync at the end for all 27 needed layers.
+ * ======================================================================== */
+
+/* GPU-only attention: bf16 tensor in, bf16 tensor out.
+ * Returns O projection output or NULL on failure. */
+static flux_gpu_tensor_t qwen3_attention_gpu(qwen3_model_t *model,
+                                              qwen3_layer_t *layer,
+                                              flux_gpu_tensor_t norm_out,
+                                              int seq_len,
+                                              const int *attention_mask) {
+    int num_heads = QWEN3_NUM_HEADS;
+    int num_kv_heads = QWEN3_NUM_KV_HEADS;
+    int head_dim = QWEN3_HEAD_DIM;
+    int hidden = QWEN3_HIDDEN_SIZE;
+    int q_dim = num_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* Q, K, V projections (bf16 → bf16) */
+    flux_gpu_tensor_t q = flux_gpu_linear_bf16_native(norm_out, layer->attn.q_proj_weight_bf16,
+                                                       seq_len, hidden, q_dim);
+    flux_gpu_tensor_t k = flux_gpu_linear_bf16_native(norm_out, layer->attn.k_proj_weight_bf16,
+                                                       seq_len, hidden, kv_dim);
+    flux_gpu_tensor_t v = flux_gpu_linear_bf16_native(norm_out, layer->attn.v_proj_weight_bf16,
+                                                       seq_len, hidden, kv_dim);
+    if (!q || !k || !v) goto fail_qkv;
+
+    /* Q/K RMS normalization on GPU */
+    if (layer->attn.q_norm_weight_bf16 && layer->attn.k_norm_weight_bf16) {
+        flux_gpu_tensor_t q_norm_w = bf16_ptr_to_bf16_tensor(layer->attn.q_norm_weight_bf16, head_dim);
+        flux_gpu_tensor_t k_norm_w = bf16_ptr_to_bf16_tensor(layer->attn.k_norm_weight_bf16, head_dim);
+        if (!q_norm_w || !k_norm_w) {
+            if (q_norm_w) flux_gpu_tensor_free(q_norm_w);
+            if (k_norm_w) flux_gpu_tensor_free(k_norm_w);
+            goto fail_qkv;
+        }
+        flux_gpu_head_rms_norm_bf16(q, q_norm_w, seq_len, num_heads, head_dim, QWEN3_RMS_NORM_EPS);
+        flux_gpu_head_rms_norm_bf16(k, k_norm_w, seq_len, num_kv_heads, head_dim, QWEN3_RMS_NORM_EPS);
+        flux_gpu_tensor_free(q_norm_w);
+        flux_gpu_tensor_free(k_norm_w);
+    }
+
+    /* RoPE */
+    flux_gpu_rope_text_bf16(q, k, model->rope_cos, model->rope_sin,
+                             seq_len, num_heads, num_kv_heads, head_dim);
+
+    /* Causal attention */
+    flux_gpu_tensor_t attn_out = flux_gpu_tensor_alloc_f16(seq_len * q_dim);
+    if (!attn_out) goto fail_qkv;
+    if (!flux_gpu_causal_attention_bf16(attn_out, q, k, v, attention_mask,
+                                        seq_len, num_heads, num_kv_heads,
+                                        head_dim, scale)) {
+        flux_gpu_tensor_free(attn_out);
+        goto fail_qkv;
+    }
+    flux_gpu_tensor_free(q);
+    flux_gpu_tensor_free(k);
+    flux_gpu_tensor_free(v);
+
+    /* O projection */
+    flux_gpu_tensor_t out = flux_gpu_linear_bf16_native(attn_out, layer->attn.o_proj_weight_bf16,
+                                                         seq_len, q_dim, hidden);
+    flux_gpu_tensor_free(attn_out);
+    return out;
+
+fail_qkv:
+    if (q) flux_gpu_tensor_free(q);
+    if (k) flux_gpu_tensor_free(k);
+    if (v) flux_gpu_tensor_free(v);
+    return NULL;
+}
+
+/* GPU-only MLP: bf16 tensor in, bf16 tensor out.
+ * Returns down projection output or NULL on failure. */
+static flux_gpu_tensor_t qwen3_mlp_gpu(qwen3_layer_t *layer,
+                                         flux_gpu_tensor_t norm_out,
+                                         int seq_len) {
+    int hidden = QWEN3_HIDDEN_SIZE;
+    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+
+    flux_gpu_tensor_t gate = flux_gpu_linear_bf16_native(norm_out, layer->mlp.gate_proj_weight_bf16,
+                                                          seq_len, hidden, intermediate);
+    flux_gpu_tensor_t up = flux_gpu_linear_bf16_native(norm_out, layer->mlp.up_proj_weight_bf16,
+                                                        seq_len, hidden, intermediate);
+    if (!gate || !up) {
+        if (gate) flux_gpu_tensor_free(gate);
+        if (up) flux_gpu_tensor_free(up);
+        return NULL;
+    }
+
+    flux_gpu_silu_mul_bf16(gate, up, seq_len * intermediate);
+    flux_gpu_tensor_free(up);
+
+    flux_gpu_tensor_t out = flux_gpu_linear_bf16_native(gate, layer->mlp.down_proj_weight_bf16,
+                                                         seq_len, intermediate, hidden);
+    flux_gpu_tensor_free(gate);
+    return out;
+}
+
+/* Fully GPU-resident forward pass.
+ * hidden_state must already be set (from embedding lookup).
+ * Fills model->layer_outputs[0..2] with layers 8, 17, 26 outputs.
+ * Only processes layers 0..26 (layers 27-35 are unused by output).
+ * Returns 1 on success, 0 on failure. */
+static int qwen3_forward_gpu(qwen3_model_t *model, int seq_len, const int *attention_mask) {
+    int hidden = QWEN3_HIDDEN_SIZE;
+
+    /* Upload hidden state to GPU as bf16 */
+    flux_gpu_batch_begin();
+    flux_gpu_tensor_t hidden_gpu = f32_to_bf16_tensor(model->hidden_state, seq_len * hidden);
+    if (!hidden_gpu) {
+        flux_gpu_batch_end();
+        return 0;
+    }
+
+    /* Allocate tensors for saved layer outputs */
+    flux_gpu_tensor_t saved[3] = {NULL, NULL, NULL};
+    for (int i = 0; i < 3; i++) {
+        saved[i] = flux_gpu_tensor_alloc_f16(seq_len * hidden);
+        if (!saved[i]) {
+            for (int j = 0; j <= i; j++) if (saved[j]) flux_gpu_tensor_free(saved[j]);
+            flux_gpu_tensor_free(hidden_gpu);
+            flux_gpu_batch_end();
+            return 0;
+        }
+    }
+
+    int ok = 1;
+
+    for (int layer_idx = 0; layer_idx <= QWEN3_OUTPUT_LAYER_3; layer_idx++) {
+        qwen3_layer_t *layer = &model->layers[layer_idx];
+
+        /* Load weights on demand (mmap mode) */
+        if (model->use_mmap) {
+            safetensors_file_t *files[2] = {model->sf_files[0], model->sf_files[1]};
+            if (load_layer_weights_small_f32(layer, files, 2, layer_idx) != 0) {
+                ok = 0; break;
+            }
+            load_layer_weights_bf16(layer, files, 2, layer_idx);
+        }
+
+        if (!layer->attn.q_proj_weight_bf16 || !layer->mlp.gate_proj_weight_bf16) {
+            ok = 0; break;
+        }
+
+        /* Input RMS norm */
+        flux_gpu_tensor_t norm_w = f32_to_bf16_tensor(layer->input_layernorm_weight, hidden);
+        flux_gpu_tensor_t norm_out = flux_gpu_tensor_alloc_f16(seq_len * hidden);
+        if (!norm_w || !norm_out) {
+            if (norm_w) flux_gpu_tensor_free(norm_w);
+            if (norm_out) flux_gpu_tensor_free(norm_out);
+            ok = 0; break;
+        }
+        flux_gpu_rms_norm_bf16(norm_out, hidden_gpu, norm_w, seq_len, hidden, QWEN3_RMS_NORM_EPS);
+        flux_gpu_tensor_free(norm_w);
+
+        /* Attention */
+        flux_gpu_tensor_t attn_out = qwen3_attention_gpu(model, layer, norm_out, seq_len, attention_mask);
+        flux_gpu_tensor_free(norm_out);
+        if (!attn_out) { ok = 0; break; }
+
+        /* Residual: hidden += attn_out */
+        flux_gpu_add_bf16(hidden_gpu, hidden_gpu, attn_out, seq_len * hidden);
+        flux_gpu_tensor_free(attn_out);
+
+        /* Post-attention RMS norm */
+        flux_gpu_tensor_t post_norm_w = f32_to_bf16_tensor(layer->post_attention_layernorm_weight, hidden);
+        norm_out = flux_gpu_tensor_alloc_f16(seq_len * hidden);
+        if (!post_norm_w || !norm_out) {
+            if (post_norm_w) flux_gpu_tensor_free(post_norm_w);
+            if (norm_out) flux_gpu_tensor_free(norm_out);
+            ok = 0; break;
+        }
+        flux_gpu_rms_norm_bf16(norm_out, hidden_gpu, post_norm_w, seq_len, hidden, QWEN3_RMS_NORM_EPS);
+        flux_gpu_tensor_free(post_norm_w);
+
+        /* MLP */
+        flux_gpu_tensor_t mlp_out = qwen3_mlp_gpu(layer, norm_out, seq_len);
+        flux_gpu_tensor_free(norm_out);
+        if (!mlp_out) { ok = 0; break; }
+
+        /* Residual: hidden += mlp_out */
+        flux_gpu_add_bf16(hidden_gpu, hidden_gpu, mlp_out, seq_len * hidden);
+        flux_gpu_tensor_free(mlp_out);
+
+        /* Free layer weights (mmap mode) */
+        if (model->use_mmap) {
+            free_layer_weights(layer);
+        }
+
+        /* Save output at extraction layers (GPU blit copy) */
+        if (layer_idx == QWEN3_OUTPUT_LAYER_1)
+            flux_gpu_copy_bf16(saved[0], hidden_gpu, seq_len * hidden);
+        else if (layer_idx == QWEN3_OUTPUT_LAYER_2)
+            flux_gpu_copy_bf16(saved[1], hidden_gpu, seq_len * hidden);
+        else if (layer_idx == QWEN3_OUTPUT_LAYER_3)
+            flux_gpu_copy_bf16(saved[2], hidden_gpu, seq_len * hidden);
+
+        if (flux_text_progress_callback)
+            flux_text_progress_callback(layer_idx, model->num_layers);
+    }
+
+    if (!ok) {
+        flux_gpu_batch_end();
+        for (int i = 0; i < 3; i++) if (saved[i]) flux_gpu_tensor_free(saved[i]);
+        flux_gpu_tensor_free(hidden_gpu);
+        return 0;
+    }
+
+    /* Convert saved bf16 → f32 on GPU (still within batch) */
+    flux_gpu_tensor_t saved_f32[3] = {NULL, NULL, NULL};
+    for (int i = 0; i < 3; i++)
+        saved_f32[i] = flux_gpu_tensor_bf16_to_f32(saved[i]);
+
+    /* Execute everything in one GPU sync */
+    flux_gpu_batch_end();
+
+    /* Signal full completion for progress display */
+    if (flux_text_progress_callback)
+        flux_text_progress_callback(model->num_layers - 1, model->num_layers);
+
+    /* Read f32 results to CPU */
+    int read_ok = 1;
+    for (int i = 0; i < 3; i++) {
+        if (saved_f32[i]) {
+            flux_gpu_tensor_read(saved_f32[i], model->layer_outputs[i]);
+            flux_gpu_tensor_free(saved_f32[i]);
+        } else {
+            read_ok = 0;
+        }
+        flux_gpu_tensor_free(saved[i]);
+    }
+    flux_gpu_tensor_free(hidden_gpu);
+
+    return read_ok;
+}
+
 #endif /* USE_METAL */
 
 /* ========================================================================
@@ -798,6 +1041,7 @@ static void qwen3_layer_forward_bf16(qwen3_model_t *model, qwen3_layer_t *layer,
 float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
                      const int *attention_mask, int seq_len) {
     int hidden = QWEN3_HIDDEN_SIZE;
+    float *output;
 
     /* Embedding lookup */
     for (int s = 0; s < seq_len; s++) {
@@ -814,6 +1058,14 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 
     /* Run through transformer layers */
 #ifdef USE_METAL
+    /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
+    if (model->use_bf16 && flux_metal_available() && seq_len <= 512) {
+        if (qwen3_forward_gpu(model, seq_len, attention_mask))
+            goto concatenate;
+        /* GPU path failed, fall through to mixed CPU/GPU path.
+         * hidden_state is unmodified (GPU worked on a copy). */
+    }
+
     /* Start batch mode to reduce GPU sync overhead between layers */
     int batch_mode = model->use_bf16 && flux_metal_available();
     if (batch_mode) {
@@ -881,20 +1133,20 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 #endif
 
-    /* Concatenate outputs from layers 9, 18, 27 -> [seq_len, 7680] */
-    float *output = malloc(seq_len * QWEN3_TEXT_DIM * sizeof(float));
+    /* Concatenate outputs from layers 8, 17, 26 -> [seq_len, 7680] */
+#ifdef USE_METAL
+concatenate: (void)0;
+#endif
+    output = malloc(seq_len * QWEN3_TEXT_DIM * sizeof(float));
     if (!output) return NULL;
 
     for (int s = 0; s < seq_len; s++) {
-        /* Copy layer 9 output */
         memcpy(output + s * QWEN3_TEXT_DIM,
                model->layer_outputs[0] + s * hidden,
                hidden * sizeof(float));
-        /* Copy layer 18 output */
         memcpy(output + s * QWEN3_TEXT_DIM + hidden,
                model->layer_outputs[1] + s * hidden,
                hidden * sizeof(float));
-        /* Copy layer 27 output */
         memcpy(output + s * QWEN3_TEXT_DIM + 2 * hidden,
                model->layer_outputs[2] + s * hidden,
                hidden * sizeof(float));
